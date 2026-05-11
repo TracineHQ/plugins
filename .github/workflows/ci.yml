@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate marketplace manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude --version
+      - run: claude plugin validate ./.claude-plugin/marketplace.json
+
+  install:
+    name: Install plugins (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude --version
+
+      - name: Add tracine marketplace from local checkout
+        run: claude plugin marketplace add ./
+
+      - name: Install guard
+        run: claude plugin install guard@tracine
+
+      - name: Install convo
+        run: claude plugin install convo@tracine
+
+      - name: Assert both plugins loaded cleanly
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTPUT=$(claude plugin list)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "guard@tracine"  || { echo "FAIL: guard not in plugin list"; exit 1; }
+          echo "$OUTPUT" | grep -q "convo@tracine"  || { echo "FAIL: convo not in plugin list"; exit 1; }
+          if echo "$OUTPUT" | grep -q "failed to load"; then
+            echo "FAIL: one or more plugins reported 'failed to load'"
+            exit 1
+          fi
+          if echo "$OUTPUT" | grep -q "Status: ✘"; then
+            echo "FAIL: one or more plugins reported a non-enabled status"
+            exit 1
+          fi
+          echo "OK: guard and convo both enabled."
