@@ -1,0 +1,167 @@
+name: Sync marketplace on plugin release
+
+# Event-driven counterpart to `sync-marketplace-versions.yml` (cron).
+# Fires when a managed plugin (guard, convo) publishes a stable release;
+# the plugin's `release.yml` sends a `repository_dispatch` event of type
+# `plugin-released` with `{plugin, version}` in the client_payload.
+#
+# Opens a PR bumping that plugin's `version` field in marketplace.json and
+# enables auto-merge so the marketplace catches up within minutes rather
+# than waiting up to 24h for the daily cron sync. The cron stays in place
+# as a safety net for any dispatch that gets dropped.
+
+on:
+  repository_dispatch:
+    types: [plugin-released]
+
+concurrency:
+  # Serialize per plugin so two near-simultaneous releases don't race on
+  # the same branch / PR. Distinct plugins can sync in parallel.
+  group: sync-on-release-${{ github.event.client_payload.plugin }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync ${{ github.event.client_payload.plugin }} ${{ github.event.client_payload.version }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate dispatch payload
+        env:
+          PLUGIN: ${{ github.event.client_payload.plugin }}
+          VERSION: ${{ github.event.client_payload.version }}
+        shell: bash
+        run: |
+          set -eu
+          if [ -z "$PLUGIN" ] || [ -z "$VERSION" ]; then
+            echo "ERROR: client_payload missing plugin or version"
+            exit 1
+          fi
+          case "$PLUGIN" in
+            guard|convo) ;;
+            *)
+              echo "ERROR: plugin '$PLUGIN' not in whitelist (guard, convo)"
+              exit 1
+              ;;
+          esac
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: version '$VERSION' must match X.Y.Z"
+            exit 1
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: true
+
+      - name: Bump plugin version in marketplace.json
+        id: bump
+        env:
+          PLUGIN: ${{ github.event.client_payload.plugin }}
+          VERSION: ${{ github.event.client_payload.version }}
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          """In-place bump of a single plugin entry's version field.
+
+          The marketplace.json layout is:
+            "plugins": [
+              { "name": "guard", "version": "1.4.1", ... },
+              { "name": "convo", "version": "2.0.0", ... }
+            ]
+
+          We locate the named plugin's block and rewrite the immediately-
+          following "version": "..." field. This mirrors the regex shape
+          used by `cut-release-reusable.yml` -- whitespace-tolerant,
+          quote-anchored, exactly-one-match invariant per plugin.
+          """
+          from __future__ import annotations
+
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          plugin = os.environ["PLUGIN"]
+          version = os.environ["VERSION"]
+          path = Path(".claude-plugin/marketplace.json")
+          text = path.read_text(encoding="utf-8")
+
+          # Match: "name": "<plugin>", ... "version": "X.Y.Z"
+          # The DOTALL is needed because there can be other fields between
+          # name and version (description, author, ...). Bound the search
+          # with the first subsequent "version" field so we don't accidentally
+          # cross into the next plugin entry.
+          pattern = re.compile(
+              rf'("name"\s*:\s*"{re.escape(plugin)}"\s*,'
+              r'(?:[^{}]*?))'
+              r'("version"\s*:\s*)"[^"]+"',
+              re.DOTALL,
+          )
+          matches = pattern.findall(text)
+          if len(matches) != 1:
+              print(
+                  f"ERROR: expected 1 plugin entry for '{plugin}', "
+                  f"found {len(matches)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          new_text = pattern.sub(rf'\g<1>\g<2>"{version}"', text, count=1)
+          if new_text == text:
+              print(f"noop: {plugin} already at {version}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                  fh.write("changed=false\n")
+              sys.exit(0)
+
+          path.write_text(new_text, encoding="utf-8")
+          print(f"bumped: {plugin} -> {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("changed=true\n")
+          PY
+
+      - name: Open auto-merge PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN: ${{ github.event.client_payload.plugin }}
+          VERSION: ${{ github.event.client_payload.version }}
+        shell: bash
+        run: |
+          set -eu
+          branch="auto-sync/${PLUGIN}-${VERSION}"
+          title="Sync ${PLUGIN} ${VERSION} in marketplace"
+
+          # If a previous dispatch already opened this exact branch, skip --
+          # the human (or auto-merge) will land it; firing twice would create
+          # a duplicate PR for the same version.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "branch $branch already exists on origin; skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$branch"
+          git add .claude-plugin/marketplace.json
+          git commit -m "$title"
+          git push -u origin "$branch"
+
+          pr_url=$(gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "$title" \
+            --body "Auto-sync triggered by ${PLUGIN}'s release.yml \`repository_dispatch\` (plugin-released, v${VERSION}). The daily cron sync (\`sync-marketplace-versions.yml\`) remains in place as a safety net.")
+
+          echo "Opened $pr_url"
+          # Best-effort: enable auto-merge once branch protection's required
+          # checks pass. Non-fatal if the repo doesn't have auto-merge
+          # enabled -- the PR still lands via the daily cron + human review.
+          gh pr merge "$pr_url" --auto --squash || \
+            echo "WARN: could not enable auto-merge on $pr_url (continuing)"

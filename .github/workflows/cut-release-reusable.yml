@@ -1,0 +1,312 @@
+name: Cut release (reusable)
+
+# Reusable workflow that performs the file-edit half of a TracineHQ plugin
+# release: bumps version in every indicator the target repo uses
+# (pyproject.toml, .claude-plugin/plugin.json, .claude-plugin/marketplace.json,
+# uv.lock) and rolls the CHANGELOG `[Unreleased]` section into
+# `[X.Y.Z] - <today>`. Opens a PR against the target repo's main branch.
+#
+# Called from each managed plugin repo's `cut-release.yml`. The merge of the
+# resulting PR is operator-driven; tagging and pushing the tag happens locally
+# (signed tag), which then fires the target repo's `release.yml`.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Semver X.Y.Z (no leading v, no suffix)'
+        required: true
+        type: string
+      target_repo:
+        description: 'Plugin repo name within TracineHQ org (guard | convo)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Print diff and exit without pushing'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    name: Cut ${{ inputs.version }} in ${{ inputs.target_repo }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate inputs
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+        shell: bash
+        run: |
+          set -eu
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: version '$INPUT_VERSION' must match X.Y.Z (no prefix, no suffix)"
+            exit 1
+          fi
+          case "$INPUT_TARGET_REPO" in
+            guard|convo) ;;
+            *)
+              echo "ERROR: target_repo '$INPUT_TARGET_REPO' not in whitelist (guard, convo)"
+              exit 1
+              ;;
+          esac
+          echo "OK: cutting $INPUT_VERSION in TracineHQ/$INPUT_TARGET_REPO"
+
+      - name: Checkout ${{ inputs.target_repo }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: TracineHQ/${{ inputs.target_repo }}
+          # gh CLI in later steps re-uses this token; persist-credentials:true
+          # is intentional so we can push the release branch.
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          enable-cache: false
+
+      - name: Apply version bumps and roll CHANGELOG
+        id: bump
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          """Mirror of ~/develop/tracine-ops/bin/cut-release file-edit logic.
+
+          Regex invariants (must match the source-of-truth script exactly):
+            pyproject.toml      : exactly 1 top-level version line
+            .claude-plugin/plugin.json: exactly 1 top-level version field
+            .claude-plugin/marketplace.json: exactly 2 version fields (metadata + plugin entry)
+            uv.lock             : exactly 1 [[package]] entry for the project itself
+          """
+          from __future__ import annotations
+
+          import datetime as dt
+          import difflib
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          version = os.environ["INPUT_VERSION"]
+          repo_name = os.environ["INPUT_TARGET_REPO"]
+          today = dt.datetime.now(tz=dt.UTC).date().isoformat()
+          repo = Path.cwd()
+
+          def fail(msg: str) -> None:
+              print(f"ERROR: {msg}", file=sys.stderr)
+              sys.exit(1)
+
+          def replace_pyproject(text: str, new: str) -> str:
+              pattern = re.compile(r'^version\s*=\s*"[^"]+"\s*$', re.MULTILINE)
+              matches = pattern.findall(text)
+              if len(matches) != 1:
+                  fail(f"pyproject.toml: expected 1 top-level version line, found {len(matches)}")
+              return pattern.sub(f'version = "{new}"', text, count=1)
+
+          def replace_plugin_json(text: str, new: str) -> str:
+              pattern = re.compile(r'(\n  "version"\s*:\s*)"[^"]+"')
+              matches = pattern.findall(text)
+              if len(matches) != 1:
+                  fail(f"plugin.json: expected 1 top-level version field, found {len(matches)}")
+              return pattern.sub(rf'\g<1>"{new}"', text, count=1)
+
+          def project_name_from_pyproject(text: str) -> str:
+              m = re.search(r'^name\s*=\s*"([^"]+)"\s*$', text, re.MULTILINE)
+              if not m:
+                  fail("could not find [project].name in pyproject.toml")
+              return m.group(1)  # type: ignore[union-attr]
+
+          def replace_uv_lock(text: str, project_name: str, new: str) -> str:
+              pattern = re.compile(
+                  rf'(name\s*=\s*"{re.escape(project_name)}"\s*\nversion\s*=\s*)"[^"]+"'
+              )
+              matches = pattern.findall(text)
+              if len(matches) != 1:
+                  fail(
+                      f"uv.lock: expected 1 entry for project '{project_name}', "
+                      f"found {len(matches)}"
+                  )
+              return pattern.sub(rf'\g<1>"{new}"', text, count=1)
+
+          def replace_marketplace(text: str, repo_name: str, new: str) -> str:
+              pattern = re.compile(r'("version"\s*:\s*)"[^"]+"')
+              matches = pattern.findall(text)
+              if len(matches) != 2:
+                  fail(
+                      f"marketplace.json: expected 2 version fields "
+                      f"(metadata + 1 plugin entry), found {len(matches)}"
+                  )
+              if f'"name": "{repo_name}"' not in text:
+                  fail(f"marketplace.json: no plugin entry for '{repo_name}'")
+              return pattern.sub(rf'\g<1>"{new}"', text)
+
+          def roll_changelog(text: str, version: str, today: str) -> str:
+              header_re = re.compile(r"^## \[Unreleased\][ \t]*$", re.MULTILINE)
+              m = header_re.search(text)
+              if not m:
+                  fail("CHANGELOG.md has no `## [Unreleased]` section")
+              start = m.end()  # type: ignore[union-attr]
+              next_header = re.search(r"^## \[", text[start:], re.MULTILINE)
+              section_end = start + next_header.start() if next_header else len(text)
+              body = text[start:section_end].strip()
+              if not body:
+                  fail(
+                      "CHANGELOG.md `[Unreleased]` section is empty -- "
+                      "nothing to release"
+                  )
+              return header_re.sub(
+                  f"## [Unreleased]\n\n## [{version}] - {today}", text, count=1
+              )
+
+          edits: list[tuple[Path, str, str]] = []
+
+          pyproject = repo / "pyproject.toml"
+          project_name: str | None = None
+          if pyproject.is_file():
+              text = pyproject.read_text(encoding="utf-8")
+              project_name = project_name_from_pyproject(text)
+              edits.append((pyproject, text, replace_pyproject(text, version)))
+
+          uv_lock = repo / "uv.lock"
+          if uv_lock.is_file() and project_name is not None:
+              text = uv_lock.read_text(encoding="utf-8")
+              edits.append((uv_lock, text, replace_uv_lock(text, project_name, version)))
+
+          plugin_json = repo / ".claude-plugin" / "plugin.json"
+          if plugin_json.is_file():
+              text = plugin_json.read_text(encoding="utf-8")
+              edits.append((plugin_json, text, replace_plugin_json(text, version)))
+
+          marketplace_json = repo / ".claude-plugin" / "marketplace.json"
+          if marketplace_json.is_file():
+              text = marketplace_json.read_text(encoding="utf-8")
+              edits.append(
+                  (marketplace_json, text, replace_marketplace(text, repo_name, version))
+              )
+
+          changelog = repo / "CHANGELOG.md"
+          if not changelog.is_file():
+              fail("CHANGELOG.md not found -- every managed repo must have one")
+          text = changelog.read_text(encoding="utf-8")
+          edits.append((changelog, text, roll_changelog(text, version, today)))
+
+          no_ops = [str(p) for p, before, after in edits if before == after]
+          if no_ops:
+              fail(
+                  f"planned edits are no-ops (already at {version}?): {no_ops}"
+              )
+
+          combined_diff_lines: list[str] = []
+          for path, before, after in edits:
+              rel = path.relative_to(repo)
+              combined_diff_lines.extend(
+                  difflib.unified_diff(
+                      before.splitlines(keepends=True),
+                      after.splitlines(keepends=True),
+                      fromfile=str(rel),
+                      tofile=str(rel),
+                      n=2,
+                  )
+              )
+              path.write_text(after, encoding="utf-8")
+
+          diff_text = "".join(combined_diff_lines)
+          print(diff_text)
+
+          # Persist diff for the PR-body step. Use a heredoc-friendly delimiter
+          # since unified diffs contain arbitrary text.
+          gh_output = os.environ.get("GITHUB_OUTPUT")
+          if gh_output:
+              with open(gh_output, "a", encoding="utf-8") as fh:
+                  fh.write("today=" + today + "\n")
+                  fh.write("diff<<__CUT_RELEASE_DIFF_EOF__\n")
+                  fh.write(diff_text)
+                  if not diff_text.endswith("\n"):
+                      fh.write("\n")
+                  fh.write("__CUT_RELEASE_DIFF_EOF__\n")
+          PY
+
+      - name: Dry-run summary
+        if: inputs.dry_run
+        shell: bash
+        run: |
+          echo "--dry-run: edits applied locally on the runner but not pushed."
+          echo "See the previous step's log for the unified diff."
+
+      - name: Open release PR
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+          BUMP_DIFF: ${{ steps.bump.outputs.diff }}
+          BUMP_TODAY: ${{ steps.bump.outputs.today }}
+        shell: bash
+        run: |
+          set -eu
+          branch="release/${INPUT_VERSION}"
+          title="Cut ${INPUT_VERSION} release"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Refuse to clobber an existing release branch -- safer to surface
+          # the collision than to silently force-push.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "ERROR: branch $branch already exists on origin"
+            exit 1
+          fi
+
+          git checkout -b "$branch"
+          git add pyproject.toml uv.lock .claude-plugin/plugin.json .claude-plugin/marketplace.json CHANGELOG.md 2>/dev/null || true
+          # Some repos don't have uv.lock or one of the plugin files; only
+          # commit what actually changed.
+          if git diff --cached --quiet; then
+            echo "ERROR: nothing staged after edits -- aborting"
+            exit 1
+          fi
+          git commit -m "$title"
+          git push -u origin "$branch"
+
+          body_file="$(mktemp)"
+          {
+            echo "Automated release cut by \`cut-release-reusable.yml\`."
+            echo ""
+            echo "Target version: \`${INPUT_VERSION}\`"
+            echo "Date: \`${BUMP_TODAY}\`"
+            echo ""
+            echo "## Next steps"
+            echo ""
+            echo "1. Review and merge this PR."
+            echo "2. Locally: \`git tag -s v${INPUT_VERSION} -m \"v${INPUT_VERSION}\" && git push origin v${INPUT_VERSION}\`"
+            echo "3. The tag push fires \`release.yml\` (TestPyPI -> PyPI -> GitHub release -> plugins sync dispatch)."
+            echo ""
+            echo "## Diff"
+            echo ""
+            echo '```diff'
+            printf '%s\n' "$BUMP_DIFF"
+            echo '```'
+          } > "$body_file"
+
+          gh pr create \
+            --repo "TracineHQ/${INPUT_TARGET_REPO}" \
+            --base main \
+            --head "$branch" \
+            --title "$title" \
+            --body-file "$body_file"
