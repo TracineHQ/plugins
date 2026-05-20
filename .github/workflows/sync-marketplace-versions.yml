@@ -1,0 +1,104 @@
+name: Sync marketplace versions
+
+# Reads each plugin's latest GitHub release tag and opens a PR if the
+# version field in .claude-plugin/marketplace.json drifts. Cron-driven
+# so a stale display field can never live longer than a day; manual
+# workflow_dispatch supported with a ``--dry-run`` flag for ad-hoc checks.
+
+on:
+  schedule:
+    # 09:17 UTC daily -- offset from the top of the hour to spread Actions
+    # load and avoid the :00 cold-pool. Stale display metadata is bounded
+    # by 24h; tighter cadence buys little.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report drift without opening a PR'
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    # Validate the script + workflow without opening PRs from PRs.
+    paths:
+      - 'scripts/sync_marketplace_versions.py'
+      - '.github/workflows/sync-marketplace-versions.yml'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync marketplace versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run sync script
+        id: sync
+        env:
+          # Drop into the GitHub API to fetch each plugin's latest release.
+          # GITHUB_TOKEN here is the workflow's ephemeral token; it has read
+          # access to public repos which is all the script needs (read /
+          # releases / latest).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # Dry-run on PRs (no write) and when the dispatch input asks for it;
+          # full sync on cron + bare workflow_dispatch.
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ inputs.dry_run }}" = "true" ]; then
+            python3 scripts/sync_marketplace_versions.py --dry-run || rc=$?
+          else
+            python3 scripts/sync_marketplace_versions.py || rc=$?
+          fi
+          rc=${rc:-0}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # rc 0 = no drift, 1 = drift (would write / wrote), 2 = error
+          if [ "$rc" = "2" ]; then
+            exit 2
+          fi
+
+      - name: Open PR with version bumps
+        if: |
+          steps.sync.outputs.rc == '1'
+          && inputs.dry_run != 'true'
+          && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          title="chore: sync marketplace.json versions to latest releases"
+
+          # Skip if an open sync PR already exists -- humans can merge that
+          # one and the next cron will reconcile any remaining drift.
+          existing=$(gh pr list --state open --search "in:title \"$title\"" --json number -q '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            echo "Open sync PR #$existing already exists; skipping."
+            exit 0
+          fi
+
+          # Run-ID suffix avoids same-day branch collisions across cron +
+          # manual dispatch overlap.
+          branch="bot/sync-marketplace-versions-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # checkout step ran with persist-credentials:false; wire gh's token
+          # into git so the push below authenticates.
+          gh auth setup-git
+
+          git checkout -b "$branch"
+          git add .claude-plugin/marketplace.json
+          git commit -m "$title"
+          git push -u origin "$branch"
+          gh pr create \
+            --title "$title" \
+            --body "Daily auto-sync from the source repos' latest GitHub release tags. See workflow run logs for the specific bumps."
