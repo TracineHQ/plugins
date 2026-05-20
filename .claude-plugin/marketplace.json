@@ -13,7 +13,7 @@
   "plugins": [
     {
       "name": "guard",
-      "version": "1.0.0",
+      "version": "1.4.1",
       "description": "Safety hooks for Claude Code (rm -rf, credential exfil, force-pushes, protected files, subagent scope) with a queryable JSONL decision log.",
       "author": {
         "name": "TracineHQ contributors",
@@ -28,7 +28,7 @@
     },
     {
       "name": "convo",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "SQLite-backed analytics CLI for Claude Code sessions. Indexes session logs, full-text search across transcripts, tool-call analytics, atomic snapshot/restore.",
       "author": {
         "name": "Anthony Ledesma",
