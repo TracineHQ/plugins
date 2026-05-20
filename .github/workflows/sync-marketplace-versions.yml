@@ -67,6 +67,22 @@ jobs:
             exit 2
           fi
 
+      # Bot-opened PRs don't trigger workflow_run (GitHub guard against
+      # recursion), so the marketplace validator never sees the bot's diff.
+      # Run the same validator inline before pushing -- a malformed manifest
+      # fails the workflow loudly instead of landing on a quiet PR.
+      - name: Validate marketplace manifest
+        if: steps.sync.outputs.rc == '1' && inputs.dry_run != 'true' && github.event_name != 'pull_request'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '20'
+      - name: Install Claude Code and validate
+        if: steps.sync.outputs.rc == '1' && inputs.dry_run != 'true' && github.event_name != 'pull_request'
+        run: |
+          set -eu
+          npm install -g @anthropic-ai/claude-code
+          claude plugin validate ./.claude-plugin/marketplace.json
+
       - name: Open PR with version bumps
         if: |
           steps.sync.outputs.rc == '1'
