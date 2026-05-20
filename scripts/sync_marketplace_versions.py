@@ -35,6 +35,11 @@ MARKETPLACE = REPO_ROOT / ".claude-plugin" / "marketplace.json"
 GITHUB_REPO_RE = re.compile(
     r"^https?://github\.com/(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?/?$"
 )
+# Reject release tags that contain whitespace, control chars, or shell/JSON
+# metacharacters. A compromised upstream repo could otherwise inject odd
+# strings into marketplace.json's version field. ~64-char ceiling matches
+# Git's reasonable tag length; longer tags are almost certainly noise.
+_VALID_TAG_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$")
 USER_AGENT = "tracinehq-marketplace-sync/1.0"
 
 
@@ -93,7 +98,9 @@ def _fetch_latest_release_tag(owner_repo: str, *, token: str | None) -> str | No
         msg = f"Malformed JSON from GitHub for {owner_repo}: {e}"
         raise SyncError(msg) from e
     tag = data.get("tag_name") if isinstance(data, dict) else None
-    return tag if isinstance(tag, str) else None
+    if not isinstance(tag, str) or not _VALID_TAG_RE.match(tag):
+        return None
+    return tag
 
 
 def _normalize_tag(tag: str) -> str:
@@ -127,7 +134,13 @@ def sync(*, dry_run: bool) -> int:
         if owner_repo is None:
             print(f"skip: {name}: no GitHub URL derivable from source/homepage", file=sys.stderr)
             continue
-        latest = _fetch_latest_release_tag(owner_repo, token=token)
+        # Per-plugin network errors degrade to skip so one flaky upstream
+        # doesn't block every other plugin's sync for the day.
+        try:
+            latest = _fetch_latest_release_tag(owner_repo, token=token)
+        except SyncError as e:
+            print(f"skip: {name}: {e}", file=sys.stderr)
+            continue
         if latest is None:
             print(f"skip: {name}: {owner_repo} has no published release yet", file=sys.stderr)
             continue

@@ -76,17 +76,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          branch="bot/sync-marketplace-versions-$(date -u +%Y%m%d)"
-          git config user.name "tracinehq-sync-bot"
-          git config user.email "noreply@tracinehq.dev"
+          title="chore: sync marketplace.json versions to latest releases"
 
-          # If a PR with this branch is already open, push to it; otherwise
-          # create a fresh one. ``gh pr list`` filters by head ref so a stale
-          # branch from yesterday doesn't get clobbered.
+          # Skip if an open sync PR already exists -- humans can merge that
+          # one and the next cron will reconcile any remaining drift.
+          existing=$(gh pr list --state open --search "in:title \"$title\"" --json number -q '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            echo "Open sync PR #$existing already exists; skipping."
+            exit 0
+          fi
+
+          # Run-ID suffix avoids same-day branch collisions across cron +
+          # manual dispatch overlap.
+          branch="bot/sync-marketplace-versions-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # checkout step ran with persist-credentials:false; wire gh's token
+          # into git so the push below authenticates.
+          gh auth setup-git
+
           git checkout -b "$branch"
           git add .claude-plugin/marketplace.json
-          git commit -m "chore: sync marketplace.json versions to latest releases"
+          git commit -m "$title"
           git push -u origin "$branch"
           gh pr create \
-            --title "chore: sync marketplace.json versions to latest releases" \
+            --title "$title" \
             --body "Daily auto-sync from the source repos' latest GitHub release tags. See workflow run logs for the specific bumps."
