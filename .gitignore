@@ -3,3 +3,11 @@
 .vscode/
 *.swp
 *~
+
+# Python tooling artifacts (sync_marketplace_versions.py and friends)
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
