@@ -26,6 +26,14 @@ on:
         required: false
         type: boolean
         default: false
+      app_id:
+        description: 'GitHub App ID for the tracine-plugin-dispatcher App (caller passes vars.PLUGINS_DISPATCH_APP_ID)'
+        required: true
+        type: string
+    secrets:
+      app_private_key:
+        description: 'Private key (PEM) for the tracine-plugin-dispatcher App (caller passes secrets.PLUGINS_DISPATCH_APP_PRIVATE_KEY)'
+        required: true
 
 permissions:
   contents: read
@@ -58,12 +66,25 @@ jobs:
           esac
           echo "OK: cutting $INPUT_VERSION in TracineHQ/$INPUT_TARGET_REPO"
 
+      # Push + PR-open as the App so events trigger downstream CI. The
+      # default GITHUB_TOKEN would suppress those events per GitHub's
+      # anti-recursion rule.
+      - name: Mint plugins-dispatcher app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ inputs.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: TracineHQ
+          repositories: ${{ inputs.target_repo }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Checkout ${{ inputs.target_repo }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: TracineHQ/${{ inputs.target_repo }}
-          # gh CLI in later steps re-uses this token; persist-credentials:true
-          # is intentional so we can push the release branch.
+          token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true
           fetch-depth: 0
 
@@ -352,7 +373,8 @@ jobs:
       - name: Open release PR
         if: ${{ !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TARGET_REPO: ${{ inputs.target_repo }}
           BUMP_DIFF: ${{ steps.bump.outputs.diff }}
@@ -363,8 +385,10 @@ jobs:
           branch="release/${INPUT_VERSION}"
           title="Cut ${INPUT_VERSION} release"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Bot identity per actions/create-github-app-token README.
+          app_user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${app_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
 
           # Refuse to clobber an existing release branch -- safer to surface
           # the collision than to silently force-push.
