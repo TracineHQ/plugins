@@ -77,11 +77,46 @@ jobs:
         with:
           enable-cache: false
 
+      - name: Collect merged PRs since last release
+        id: prs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -eu
+          # Find the previous release tag in the target repo. If none exists
+          # (first release), fall back to the initial commit date so we
+          # capture every merged PR.
+          if last_tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null); then
+            tag_date=$(git log -1 --format=%aI "$last_tag" | cut -dT -f1)
+            echo "Last tag: $last_tag (merged-since cutoff: $tag_date)"
+          else
+            tag_date=$(git log --format=%aI --reverse | head -1 | cut -dT -f1)
+            echo "No prior tag; using initial commit date $tag_date"
+          fi
+
+          # Fetch merged PRs against main since that date. --limit 200 is
+          # well above any realistic release cadence; if we ever exceed it,
+          # add pagination.
+          gh pr list \
+            --repo "TracineHQ/$INPUT_TARGET_REPO" \
+            --state merged \
+            --base main \
+            --search "merged:>=$tag_date" \
+            --limit 200 \
+            --json number,title,author \
+            > /tmp/merged_prs.json
+
+          cat /tmp/merged_prs.json
+
       - name: Apply version bumps and roll CHANGELOG
         id: bump
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+          MERGED_PRS_PATH: /tmp/merged_prs.json
         shell: bash
         run: |
           set -eu
@@ -98,6 +133,7 @@ jobs:
 
           import datetime as dt
           import difflib
+          import json
           import os
           import re
           import sys
@@ -107,6 +143,41 @@ jobs:
           repo_name = os.environ["INPUT_TARGET_REPO"]
           today = dt.datetime.now(tz=dt.UTC).date().isoformat()
           repo = Path.cwd()
+          merged_prs_path = Path(os.environ["MERGED_PRS_PATH"])
+
+          # Bot authors and titles to skip when synthesizing release notes.
+          # Cut-release PRs from previous runs match by title prefix; bots
+          # match by login suffix.
+          _BOT_LOGIN_SUFFIXES = ("[bot]",)
+          _BOT_LOGINS = {"dependabot[bot]", "renovate[bot]", "github-actions[bot]"}
+
+          def _is_release_pr_title(title: str) -> bool:
+              return bool(re.match(r"^Cut \d+\.\d+\.\d+ release\b", title))
+
+          def _is_bot(login: str) -> bool:
+              if login in _BOT_LOGINS:
+                  return True
+              return any(login.endswith(s) for s in _BOT_LOGIN_SUFFIXES)
+
+          def build_auto_notes() -> str:
+              if not merged_prs_path.is_file():
+                  fail(f"merged-PRs file not found at {merged_prs_path}")
+              data = json.loads(merged_prs_path.read_text(encoding="utf-8"))
+              if not isinstance(data, list):
+                  fail("merged-PRs JSON must be a list")
+              lines: list[str] = []
+              for item in data:
+                  title = (item.get("title") or "").strip()
+                  number = item.get("number")
+                  author = (item.get("author") or {}).get("login") or ""
+                  if not title or number is None:
+                      continue
+                  if _is_release_pr_title(title):
+                      continue
+                  if _is_bot(author):
+                      continue
+                  lines.append(f"- {title} (#{number})")
+              return "\n".join(lines)
 
           def fail(msg: str) -> None:
               print(f"ERROR: {msg}", file=sys.stderr)
@@ -156,7 +227,9 @@ jobs:
                   fail(f"marketplace.json: no plugin entry for '{repo_name}'")
               return pattern.sub(rf'\g<1>"{new}"', text)
 
-          def roll_changelog(text: str, version: str, today: str) -> str:
+          def roll_changelog(
+              text: str, version: str, today: str, auto_notes: str
+          ) -> str:
               header_re = re.compile(r"^## \[Unreleased\][ \t]*$", re.MULTILINE)
               m = header_re.search(text)
               if not m:
@@ -164,15 +237,34 @@ jobs:
               start = m.end()  # type: ignore[union-attr]
               next_header = re.search(r"^## \[", text[start:], re.MULTILINE)
               section_end = start + next_header.start() if next_header else len(text)
-              body = text[start:section_end].strip()
-              if not body:
+              manual_body = text[start:section_end].strip()
+
+              # Hand-written notes win when present (operators may curate
+              # phrasing for the public release page); otherwise fall back
+              # to the auto-generated bullets. If neither produced
+              # anything, refuse -- there is genuinely nothing to release.
+              if manual_body:
+                  release_body = manual_body
+              elif auto_notes.strip():
+                  release_body = auto_notes.strip()
+              else:
                   fail(
-                      "CHANGELOG.md `[Unreleased]` section is empty -- "
-                      "nothing to release"
+                      "no release notes: `[Unreleased]` is empty and no "
+                      "non-bot PRs have merged since the last tag"
                   )
-              return header_re.sub(
-                  f"## [Unreleased]\n\n## [{version}] - {today}", text, count=1
+
+              # Replace the [Unreleased] header AND its existing body in
+              # one shot so curated content moves into [X.Y.Z] cleanly.
+              # Trailing blank line keeps spacing before the next ## [...]
+              # section (or before EOF, harmlessly).
+              replacement = (
+                  f"## [Unreleased]\n\n"
+                  f"## [{version}] - {today}\n\n"
+                  f"{release_body}\n\n"
               )
+              before = text[: m.start()]  # type: ignore[union-attr]
+              after = text[section_end:]
+              return before + replacement + after
 
           edits: list[tuple[Path, str, str]] = []
 
@@ -200,11 +292,21 @@ jobs:
                   (marketplace_json, text, replace_marketplace(text, repo_name, version))
               )
 
+          auto_notes = build_auto_notes()
+          if auto_notes:
+              print("Auto-generated release notes from merged PRs:")
+              print(auto_notes)
+              print()
+          else:
+              print("No non-bot PRs merged since last tag.")
+
           changelog = repo / "CHANGELOG.md"
           if not changelog.is_file():
               fail("CHANGELOG.md not found -- every managed repo must have one")
           text = changelog.read_text(encoding="utf-8")
-          edits.append((changelog, text, roll_changelog(text, version, today)))
+          edits.append(
+              (changelog, text, roll_changelog(text, version, today, auto_notes))
+          )
 
           no_ops = [str(p) for p, before, after in edits if before == after]
           if no_ops:
