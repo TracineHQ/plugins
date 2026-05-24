@@ -26,8 +26,8 @@ on:
         required: false
         type: boolean
         default: false
-      app_id:
-        description: 'GitHub App ID for the tracine-plugin-dispatcher App (caller passes vars.PLUGINS_DISPATCH_APP_ID)'
+      client_id:
+        description: 'GitHub App client ID for the tracine-plugin-dispatcher App (caller passes vars.PLUGINS_DISPATCH_CLIENT_ID)'
         required: true
         type: string
     secrets:
@@ -73,7 +73,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
-          app-id: ${{ inputs.app_id }}
+          client-id: ${{ inputs.client_id }}
           private-key: ${{ secrets.app_private_key }}
           owner: TracineHQ
           repositories: ${{ inputs.target_repo }}
