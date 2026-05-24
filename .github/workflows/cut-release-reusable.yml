@@ -87,24 +87,26 @@ jobs:
         run: |
           set -eu
           # Find the previous release tag in the target repo. If none exists
-          # (first release), fall back to the initial commit date so we
-          # capture every merged PR.
+          # (first release), fall back to the initial commit datetime so we
+          # capture every merged PR. Uses full ISO 8601 instead of YYYY-MM-DD
+          # so the cut PR for the previous release (which merged the same day
+          # as the tag was created) is excluded by the strict-greater filter.
           if last_tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null); then
-            tag_date=$(git log -1 --format=%aI "$last_tag" | cut -dT -f1)
-            echo "Last tag: $last_tag (merged-since cutoff: $tag_date)"
+            tag_ts=$(git log -1 --format=%aI "$last_tag")
+            echo "Last tag: $last_tag (merged-since cutoff: $tag_ts)"
           else
-            tag_date=$(git log --format=%aI --reverse | head -1 | cut -dT -f1)
-            echo "No prior tag; using initial commit date $tag_date"
+            tag_ts=$(git log --format=%aI --reverse | head -1)
+            echo "No prior tag; using initial commit datetime $tag_ts"
           fi
 
-          # Fetch merged PRs against main since that date. --limit 200 is
+          # Fetch merged PRs against main since that datetime. --limit 200 is
           # well above any realistic release cadence; if we ever exceed it,
-          # add pagination.
+          # add pagination. Strict-greater (>) excludes the previous cut PR.
           gh pr list \
             --repo "TracineHQ/$INPUT_TARGET_REPO" \
             --state merged \
             --base main \
-            --search "merged:>=$tag_date" \
+            --search "merged:>$tag_ts" \
             --limit 200 \
             --json number,title,author \
             > /tmp/merged_prs.json
@@ -145,19 +147,15 @@ jobs:
           repo = Path.cwd()
           merged_prs_path = Path(os.environ["MERGED_PRS_PATH"])
 
-          # Bot authors and titles to skip when synthesizing release notes.
-          # Cut-release PRs from previous runs match by title prefix; bots
-          # match by login suffix.
-          _BOT_LOGIN_SUFFIXES = ("[bot]",)
-          _BOT_LOGINS = {"dependabot[bot]", "renovate[bot]", "github-actions[bot]"}
-
+          # Skip when synthesizing release notes:
+          #   - "Cut X.Y.Z release ..." titles (prior cut PRs from this workflow)
+          #   - any author whose JSON entry has is_bot=true
+          # The `is_bot` flag from `gh pr list --json author` is authoritative
+          # for both GitHub Apps (author.login like "app/dependabot") and bot
+          # users (login ending in "[bot]"), replacing the prior hardcoded
+          # login list which missed app-style logins.
           def _is_release_pr_title(title: str) -> bool:
               return bool(re.match(r"^Cut \d+\.\d+\.\d+ release\b", title))
-
-          def _is_bot(login: str) -> bool:
-              if login in _BOT_LOGINS:
-                  return True
-              return any(login.endswith(s) for s in _BOT_LOGIN_SUFFIXES)
 
           def build_auto_notes() -> str:
               if not merged_prs_path.is_file():
@@ -169,12 +167,12 @@ jobs:
               for item in data:
                   title = (item.get("title") or "").strip()
                   number = item.get("number")
-                  author = (item.get("author") or {}).get("login") or ""
+                  author = item.get("author") or {}
                   if not title or number is None:
                       continue
                   if _is_release_pr_title(title):
                       continue
-                  if _is_bot(author):
+                  if author.get("is_bot"):
                       continue
                   lines.append(f"- {title} (#{number})")
               return "\n".join(lines)
@@ -395,9 +393,10 @@ jobs:
             echo ""
             echo "## Next steps"
             echo ""
-            echo "1. Review and merge this PR."
-            echo "2. Locally: \`git tag -s v${INPUT_VERSION} -m \"v${INPUT_VERSION}\" && git push origin v${INPUT_VERSION}\`"
-            echo "3. The tag push fires \`release.yml\` (TestPyPI -> PyPI -> GitHub release -> plugins sync dispatch)."
+            echo "1. Review the auto-generated CHANGELOG bullets in the diff below. Edit them inline on this PR if any are infra/test-only noise."
+            echo "2. Merge this PR."
+            echo "3. Locally: \`git tag -s v${INPUT_VERSION} -m \"v${INPUT_VERSION}\" && git push origin v${INPUT_VERSION}\`"
+            echo "4. The tag push fires \`release.yml\` (TestPyPI -> PyPI -> GitHub release -> plugins sync dispatch)."
             echo ""
             echo "## Diff"
             echo ""
