@@ -28,7 +28,7 @@
     },
     {
       "name": "convo",
-      "version": "2.0.0",
+      "version": "2.0.1",
       "description": "SQLite-backed analytics CLI for Claude Code sessions. Indexes session logs, full-text search across transcripts, tool-call analytics, atomic snapshot/restore.",
       "author": {
         "name": "Anthony Ledesma",
