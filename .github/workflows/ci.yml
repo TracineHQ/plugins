@@ -54,7 +54,10 @@ jobs:
       - name: Install convo
         run: claude plugin install convo@tracine
 
-      - name: Assert both plugins loaded cleanly
+      - name: Install eval-kit
+        run: claude plugin install eval-kit@tracine
+
+      - name: Assert all plugins loaded cleanly
         shell: bash
         run: |
           set -euo pipefail
@@ -62,6 +65,7 @@ jobs:
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "guard@tracine"  || { echo "FAIL: guard not in plugin list"; exit 1; }
           echo "$OUTPUT" | grep -q "convo@tracine"  || { echo "FAIL: convo not in plugin list"; exit 1; }
+          echo "$OUTPUT" | grep -q "eval-kit@tracine" || { echo "FAIL: eval-kit not in plugin list"; exit 1; }
           if echo "$OUTPUT" | grep -q "failed to load"; then
             echo "FAIL: one or more plugins reported 'failed to load'"
             exit 1
@@ -70,4 +74,8 @@ jobs:
             echo "FAIL: one or more plugins reported a non-enabled status"
             exit 1
           fi
-          echo "OK: guard and convo both enabled."
+          # eval-kit's skill loads from a root SKILL.md; make sure the installed
+          # version actually carries it (an old default branch installs skill-less).
+          DETAILS=$(claude plugin details eval-kit@tracine)
+          echo "$DETAILS" | grep -q "Skills (1)" || { echo "FAIL: eval-kit skill missing"; exit 1; }
+          echo "OK: guard, convo, and eval-kit enabled."
